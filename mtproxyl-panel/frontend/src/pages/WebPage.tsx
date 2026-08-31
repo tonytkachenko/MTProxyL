@@ -6,10 +6,12 @@ import { ErrorAlert } from '@/components/ErrorAlert';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { OperationProgress } from '@/components/OperationProgress';
 import { ParamField } from '@/components/ParamField';
-import { mtproxylApi, type WebParam, type WebStatus } from '@/lib/api';
+import { NginxCustomConfigCard } from '@/components/NginxCustomConfigCard';
+import { mtproxylApi, type SelfmaskStatus, type WebParam, type WebStatus } from '@/lib/api';
 import { useManagerOnly, useMtproxylOperation } from '@/hooks/useMtproxyl';
 
 const LAYOUT_LABELS: Record<string, string> = {
+  web: 'WEB-only — без обычного MTProto',
   shared: 'shared — один порт с обычным прокси, разбор по SNI',
   split: 'split — у WEB свой порт',
 };
@@ -23,6 +25,7 @@ const CARRIER_LABELS: Record<string, string> = {
 
 export function WebPage() {
   const [status, setStatus] = useState<WebStatus | null>(null);
+  const [nginxStatus, setNginxStatus] = useState<SelfmaskStatus | null>(null);
   const [params, setParams] = useState<WebParam[]>([]);
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
@@ -35,8 +38,13 @@ export function WebPage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [st, ps] = await Promise.all([mtproxylApi.web(), mtproxylApi.webParams()]);
+      const [st, ps, nginx] = await Promise.all([
+        mtproxylApi.web(),
+        mtproxylApi.webParams(),
+        mtproxylApi.selfmask(),
+      ]);
       setStatus(st);
+      setNginxStatus(nginx);
       setParams(ps);
       setEdits({});
       setError(null);
@@ -47,7 +55,10 @@ export function WebPage() {
     }
   }, []);
 
-  const { operation, start, dismiss, running } = useMtproxylOperation(load, ['web:']);
+  const { operation, start, dismiss, running } = useMtproxylOperation(load, [
+    'web:',
+    'selfmask:nginx-custom-',
+  ]);
   // В реаниматоре WEB поднимает хозяин цели: включать и настраивать нам нечего,
   // MTProxyL там только читает её конфиг и собирает ссылки.
   const { allowed: isManager, loading: modeLoading } = useManagerOnly();
@@ -63,9 +74,10 @@ export function WebPage() {
 
   // В shared публичный порт задаёт сам прокси, поэтому поле не показываем.
   const layout = valueOf('WEB_LAYOUT') || 'shared';
-  const visibleParams = params.filter(
-    (p) => layout === 'split' || p.key !== 'WEB_PUBLIC_PORT',
-  );
+  const visibleParams = params.filter((p) => {
+    if (status?.proxy_mode === 'web' && ['WEB_LAYOUT', 'WEB_TLS_PORT', 'WEB_MTPROXY_PORT'].includes(p.key)) return false;
+    return layout === 'split' || status?.proxy_mode === 'web' || p.key !== 'WEB_PUBLIC_PORT';
+  });
 
   const saveParams = async (): Promise<boolean> => {
     if (dirty.length === 0) return true;
@@ -104,6 +116,16 @@ export function WebPage() {
     }
   };
 
+  const changeMode = async (mode: 'web' | 'combined') => {
+    setNotice(null);
+    if (dirty.length > 0 && !(await saveParams())) return;
+    try {
+      start(await mtproxylApi.webMode(mode));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Не удалось переключить режим');
+    }
+  };
+
   const showLinks = async () => {
     try {
       const r = await mtproxylApi.webLinks();
@@ -115,6 +137,7 @@ export function WebPage() {
 
   // Предполётные причины приходят одной строкой через точку с запятой.
   const problems = (status?.problems ?? '').split(';').map((p) => p.trim()).filter(Boolean);
+  const proxyMode = status?.proxy_mode || (status?.enabled ? 'combined' : 'mtproto');
 
   return (
     <div className="space-y-4">
@@ -148,6 +171,10 @@ export function WebPage() {
               </CardHeader>
               <CardContent className="space-y-2 text-sm">
                 <Row label="Домен" value={status.domain || 'не задан'} mono />
+                <Row
+                  label="Режим"
+                  value={proxyMode === 'web' ? 'Только WEB' : proxyMode === 'combined' ? 'MTProto + WEB' : 'Только MTProto'}
+                />
                 {/* У цели раскладку и порты задаёт её хозяин, и MTProxyL их не знает:
                     показывать нули и пустые поля честнее не показывать вовсе. */}
                 {status.layout !== 'target' && (
@@ -161,6 +188,8 @@ export function WebPage() {
                       value={
                         status.layout === 'split'
                           ? `nginx :${status.public_port} → WEB :${status.listen_port}`
+                          : status.layout === 'web'
+                            ? `nginx :${status.public_port} → WEB :${status.listen_port}`
                           : `nginx :${status.public_port} → движок :${status.mtproxy_port}, WEB :${status.listen_port}`
                       }
                       mono
@@ -207,55 +236,88 @@ export function WebPage() {
             )}
 
             {isManager && (
-            <Card>
-              <CardHeader>
-                <CardTitle>Параметры</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                {visibleParams.map((p) => (
-                  <div key={p.key} className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="text-sm text-text-primary">{p.desc}</div>
-                      <div className="font-mono text-xs text-text-secondary">{p.key}</div>
-                    </div>
-                    <ParamField
-                      param={p}
-                      value={valueOf(p.key)}
-                      onChange={(v) => setEdits((e) => ({ ...e, [p.key]: v }))}
-                      disabled={saving || running}
-                    />
-                  </div>
-                ))}
-              </CardContent>
-            </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Режим транспорта</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-wrap gap-2">
+                  <Button
+                    variant={proxyMode === 'web' ? 'default' : 'outline'}
+                    onClick={() => void changeMode('web')}
+                    disabled={running || saving}
+                  >
+                    Только WEB
+                  </Button>
+                  <Button
+                    variant={proxyMode === 'combined' ? 'default' : 'outline'}
+                    onClick={() => void changeMode('combined')}
+                    disabled={running || saving}
+                  >
+                    MTProto + WEB
+                  </Button>
+                </CardContent>
+              </Card>
             )}
 
             {isManager && (
-            <div className="flex flex-wrap gap-2">
-              {/* Кнопку не блокируем списком причин: он собран при загрузке
-                  страницы и после неудачного включения оставался бы вечным.
-                  Предполёт всё равно повторяет CLI и назовёт свежую причину. */}
-              <Button onClick={enable} disabled={saving || running}>
-                {status.enabled ? 'Применить заново' : 'Включить'}
-              </Button>
-              <Button variant="outline" onClick={() => void load()} disabled={loading || running}>
-                Проверить снова
-              </Button>
-              {status.enabled && (
-                <>
-                  <Button variant="outline" onClick={showLinks} disabled={running}>
-                    Ссылки
-                  </Button>
-                  <Button
-                    variant="danger"
-                    onClick={() => setConfirmDisable(true)}
-                    disabled={running}
-                  >
-                    Выключить
-                  </Button>
-                </>
-              )}
-            </div>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Параметры</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {visibleParams.map((p) => (
+                    <div key={p.key} className="flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-sm text-text-primary">{p.desc}</div>
+                        <div className="font-mono text-xs text-text-secondary">{p.key}</div>
+                      </div>
+                      <ParamField
+                        param={p}
+                        value={valueOf(p.key)}
+                        onChange={(v) => setEdits((e) => ({ ...e, [p.key]: v }))}
+                        disabled={saving || running}
+                      />
+                    </div>
+                  ))}
+                </CardContent>
+              </Card>
+            )}
+
+            {isManager && (
+              <div className="flex flex-wrap gap-2">
+                {/* Кнопку не блокируем списком причин: он собран при загрузке
+                    страницы и после неудачного включения оставался бы вечным.
+                    Предполёт всё равно повторяет CLI и назовёт свежую причину. */}
+                <Button onClick={enable} disabled={saving || running}>
+                  {status.enabled ? 'Применить заново' : 'Включить'}
+                </Button>
+                <Button variant="outline" onClick={() => void load()} disabled={loading || running}>
+                  Проверить снова
+                </Button>
+                {status.enabled && (
+                  <>
+                    <Button variant="outline" onClick={showLinks} disabled={running}>
+                      Ссылки
+                    </Button>
+                    {proxyMode !== 'web' && <Button
+                      variant="danger"
+                      onClick={() => setConfirmDisable(true)}
+                      disabled={running}
+                    >
+                      Выключить
+                    </Button>}
+                  </>
+                )}
+              </div>
+            )}
+
+            {isManager && nginxStatus && (
+              <NginxCustomConfigCard
+                status={nginxStatus}
+                running={running}
+                onStart={start}
+                onError={setError}
+              />
             )}
 
             {links && (

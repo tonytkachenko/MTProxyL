@@ -6,6 +6,7 @@ import { ErrorAlert } from '@/components/ErrorAlert';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { OperationProgress } from '@/components/OperationProgress';
 import { ParamField } from '@/components/ParamField';
+import { NginxCustomConfigCard } from '@/components/NginxCustomConfigCard';
 import { mtproxylApi, type SelfmaskParam, type SelfmaskStatus } from '@/lib/api';
 import { useMtproxylOperation } from '@/hooks/useMtproxyl';
 
@@ -336,6 +337,13 @@ export function SelfmaskPage() {
                 )}
               </CardContent>
             </Card>
+
+            <NginxCustomConfigCard
+              status={status}
+              running={running}
+              onStart={start}
+              onError={setError}
+            />
           </>
         )
       )}

@@ -74,6 +74,7 @@ export type MtproxylMode = 'manager' | 'reanimator';
 
 export interface MtproxylModeStatus {
   mode: MtproxylMode;
+  proxy_mode?: 'mtproto' | 'web' | 'combined';
   /** Чем менеджер держит движок: docker (контейнер) или binary (служба). */
   engine?: string;
   detected_mode: string;
@@ -102,6 +103,10 @@ export interface SelfmaskStatus {
   auto_renew: boolean;
   nginx_conf: string;
   nginx_conf_exists: boolean;
+  nginx_custom_enabled: boolean;
+  nginx_custom_active: boolean;
+  nginx_custom_file: string;
+  nginx_custom_file_exists: boolean;
   cert_found: boolean;
   pq_nginx_active: boolean;
   /** Чем проверять домен на PQ: описание источника, пусто — нечем. */
@@ -117,6 +122,8 @@ export interface SelfmaskStatus {
 
 export interface WebStatus {
   enabled: boolean;
+  proxy_mode: string;
+  mtproto_enabled?: boolean;
   /** shared — один публичный порт на двоих, split — у WEB свой. */
   layout: string;
   public_port: number;
@@ -303,6 +310,20 @@ export const mtproxylApi = {
     request<{ output: string }>(MTPROXYL_BASE, '/selfmask/verify', { method: 'POST' }),
   selfmaskDisable: () =>
     request<{ output: string }>(MTPROXYL_BASE, '/selfmask/disable', { method: 'POST' }),
+  selfmaskNginxConfig: () =>
+    request<{ content: string }>(MTPROXYL_BASE, '/selfmask/nginx-config'),
+  writeSelfmaskNginxConfig: (content: string) =>
+    request<{ output: string }>(MTPROXYL_BASE, '/selfmask/nginx-config', {
+      method: 'PUT',
+      body: JSON.stringify({ content }),
+    }),
+  toggleSelfmaskNginxConfig: (enabled: boolean) =>
+    request<MtproxylOperation>(MTPROXYL_BASE, '/selfmask/nginx-config/toggle', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+  testSelfmaskNginxConfig: () =>
+    request<{ output: string }>(MTPROXYL_BASE, '/selfmask/nginx-config/test', { method: 'POST' }),
 
   web: () => request<WebStatus>(MTPROXYL_BASE, '/web'),
   webParams: () => request<WebParam[]>(MTPROXYL_BASE, '/web/params'),
@@ -315,6 +336,11 @@ export const mtproxylApi = {
     request<MtproxylOperation>(MTPROXYL_BASE, '/web/enable', { method: 'POST' }),
   webDisable: () =>
     request<MtproxylOperation>(MTPROXYL_BASE, '/web/disable', { method: 'POST' }),
+  webMode: (mode: 'web' | 'combined') =>
+    request<MtproxylOperation>(MTPROXYL_BASE, '/web/mode', {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
   webLinks: () => request<{ output: string }>(MTPROXYL_BASE, '/web/links'),
   // Профиль WEB движок сам не заводит: пользователь, созданный через его
   // /v1/users, попадает только в [access.users] и остаётся без WEB-ссылки.

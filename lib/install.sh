@@ -82,7 +82,10 @@ run_installer() {
     draw_header "НАСТРОЙКА ПРОКСИ"
     echo ""
 
+    installer_pick_proxy_transport
+
     # Порт
+    if mtproto_is_enabled; then
     echo -e "  ${BOLD}Порт прокси${NC} ${DIM}(по умолчанию: ${PROXY_PORT:-443})${NC}"
     while true; do
         echo -en "  ${DIM}Порт [${PROXY_PORT:-443}]:${NC} "
@@ -107,6 +110,7 @@ run_installer() {
         PROXY_PORT="$port_input"
         break
     done
+    fi
 
     # Metrics port — автоматически выбираем свободный
     echo ""
@@ -168,7 +172,9 @@ run_installer() {
                 log_error "Некорректный порт"
                 continue
             fi
-            if [ "$api_input" = "${PROXY_METRICS_PORT:-9090}" ] || [ "$api_input" = "${PROXY_PORT:-443}" ]; then
+            if [ "$api_input" = "${PROXY_METRICS_PORT:-9090}" ] \
+               || { mtproto_is_enabled && [ "$api_input" = "${PROXY_PORT:-443}" ]; } \
+               || { [ "$PROXY_MODE" != "mtproto" ] && [ "$api_input" = "${WEB_PUBLIC_PORT:-443}" ]; }; then
                 log_error "Этот порт уже занят самим прокси или метриками"
                 continue
             fi
@@ -181,30 +187,34 @@ run_installer() {
         done
     fi
 
-    # IP
-    echo ""
-    local _det_ip; _det_ip=$(CUSTOM_IP="" get_public_ip)
-    echo -e "  ${BOLD}IP или домен для ссылок${NC}"
-    echo -e "  ${DIM}Определён: ${_det_ip:-?}${NC}"
-    echo -e "  ${DIM}Введите свой IPv4 или домен, либо Enter для автоопределения.${NC}"
-    echo ""
-    echo -en "  ${BOLD}IP/домен [${_det_ip:-авто}]:${NC} "
-    local ip_input=""
-    read_line ip_input
-    if [ -n "$ip_input" ]; then
-        if validate_ip_literal "$ip_input"; then
-            CUSTOM_IP="$ip_input"
-            log_success "IP: ${CUSTOM_IP}"
-        elif validate_domain "$ip_input"; then
-            CUSTOM_IP="$ip_input"
-            log_success "Домен: ${CUSTOM_IP}"
-        else
-            log_warn "Некорректный IP/домен: '${ip_input}' — используем автоопределение"
-            CUSTOM_IP=""
+    if mtproto_is_enabled; then
+        echo ""
+        local _det_ip; _det_ip=$(CUSTOM_IP="" get_public_ip)
+        echo -e "  ${BOLD}IP или домен для ссылок${NC}"
+        echo -e "  ${DIM}Определён: ${_det_ip:-?}${NC}"
+        echo -e "  ${DIM}Введите свой IPv4 или домен, либо Enter для автоопределения.${NC}"
+        echo ""
+        echo -en "  ${BOLD}IP/домен [${_det_ip:-авто}]:${NC} "
+        local ip_input=""
+        read_line ip_input
+        if [ -n "$ip_input" ]; then
+            if validate_ip_literal "$ip_input"; then
+                CUSTOM_IP="$ip_input"
+                log_success "IP: ${CUSTOM_IP}"
+            elif validate_domain "$ip_input"; then
+                CUSTOM_IP="$ip_input"
+                log_success "Домен: ${CUSTOM_IP}"
+            else
+                log_warn "Некорректный IP/домен: '${ip_input}' — используем автоопределение"
+                CUSTOM_IP=""
+            fi
         fi
+    else
+        CUSTOM_IP=""
     fi
 
-    # Домен
+    # Домен обычного FakeTLS
+    if mtproto_is_enabled; then
     echo ""
     echo -e "  ${BOLD}FakeTLS домен (потом можно будет изменить)${NC}"
     echo -e "  ${DIM}[1] autoscout24.ru  [2] m.beboo.ru  [3] twitch.tv  [4] Свой${NC}"
@@ -228,6 +238,28 @@ run_installer() {
     echo -en "  ${DIM}Включить? [Y/n]:${NC} "
     local mask_input; read_line mask_input
     [[ "$mask_input" =~ ^[nN] ]] && MASKING_ENABLED="false" || MASKING_ENABLED="true"
+    else
+        MASKING_ENABLED="false"
+    fi
+
+    if [ "$PROXY_MODE" != "mtproto" ]; then
+        echo ""
+        echo -e "  ${BOLD}Домен WEB Proxy${NC}"
+        echo -e "  ${DIM}A-запись домена должна вести на этот сервер. WEB работает только на 443.${NC}"
+        while true; do
+            echo -en "  ${BOLD}Домен:${NC} "
+            local _web_domain; read_line _web_domain
+            _web_domain="${_web_domain,,}"
+            validate_domain "$_web_domain" && { WEB_DOMAIN="$_web_domain"; break; }
+            log_error "Введите корректное доменное имя"
+        done
+        SELFMASK_DOMAIN="$WEB_DOMAIN"
+        SELFMASK_CERT_MODE="letsencrypt"
+        echo -en "  ${DIM}Email для Let's Encrypt [необязательно]:${NC} "
+        read_line SELFMASK_CERT_EMAIL
+
+        installer_pick_web_site
+    fi
 
     # Ресурсы
     echo ""
@@ -270,7 +302,12 @@ run_installer() {
     # Главный скрипт уже скачан корневым install.sh, здесь только обновляем симлинк
     ln -sf "${INSTALL_DIR}/mtproxyl.sh" /usr/local/bin/mtproxyl
 
-    run_fix_arsenal_wizard
+    if mtproto_is_enabled; then
+        run_fix_arsenal_wizard
+    else
+        log_info "MTProto-фиксы пропущены: выбран режим «Только WEB»"
+        run_meko_optimization_wizard
+    fi
 
     # Автозапуск ставим до движка: снятие прежнего юнита дёргает
     # «mtproxyl stop», и делать это после старта — значит остановить только что
@@ -282,14 +319,17 @@ run_installer() {
     echo ""
     draw_header "ЗАПУСК ПРОКСИ"
     echo ""
-    run_proxy_container || {
-        log_error "Не удалось запустить прокси"
-        if [ "${ENGINE_BACKEND:-docker}" = "binary" ]; then
-            echo -e "  ${DIM}Проверьте: journalctl -u ${ENGINE_SERVICE} -n 50${NC}"
-        else
-            echo -e "  ${DIM}Проверьте: docker logs mtproxyl${NC}"
-        fi
-    }
+    if [ "$PROXY_MODE" = "mtproto" ]; then
+        run_proxy_container || {
+            log_error "Установка остановлена: MTProto-прокси не поднялся"
+            return 1
+        }
+    else
+        web_enable || {
+            log_error "Установка остановлена: WEB Proxy не поднялся"
+            return 1
+        }
+    fi
 
     if command -v systemctl &>/dev/null; then
         install_ip_history_timer
@@ -310,6 +350,52 @@ run_installer() {
     read -rn 256 -t 0.05 _ 2>/dev/null || true
     load_settings; load_secrets
     show_main_menu
+}
+
+installer_pick_proxy_transport() {
+    echo -e "  ${BOLD}Транспорт прокси${NC}"
+    echo -e "  ${BOLD}[1]${NC} Только MTProto  ${DIM}— обычный прокси без WEB${NC}"
+    echo -e "  ${BOLD}[2]${NC} Только WEB      ${DIM}— сайт и WEB Proxy на 443${NC}"
+    echo -e "  ${BOLD}[3]${NC} MTProto + WEB   ${DIM}— оба типа прокси${NC}"
+    local _choice; _choice=$(read_choice "выбор" "1")
+    case "$_choice" in
+        2) PROXY_MODE="web" ;;
+        3) PROXY_MODE="combined" ;;
+        *) PROXY_MODE="mtproto" ;;
+    esac
+    WEB_ENABLED="false"
+    WEB_PUBLIC_PORT="443"
+}
+
+installer_pick_web_site() {
+    echo ""
+    echo -e "  ${BOLD}Сайт-заглушка WEB${NC}"
+    echo -e "  ${DIM}[1]${NC} Обычная"
+    echo -e "  ${DIM}[2]${NC} Файловый менеджер"
+    echo -e "  ${DIM}[3]${NC} Cat runner"
+    echo -e "  ${DIM}[4]${NC} MEKO runner"
+    echo -e "  ${CYAN}[5]${NC} URL файла index.html"
+    echo -e "  ${CYAN}[6]${NC} Папка с сайтом на этом сервере"
+    local _choice; _choice=$(read_choice "выбор" "1")
+    case "$_choice" in
+        2) SELFMASK_SITE_SOURCE="filemanager" ;;
+        3) SELFMASK_SITE_SOURCE="catrunner" ;;
+        4) SELFMASK_SITE_SOURCE="mekorunner" ;;
+        5)
+            echo -en "  ${BOLD}URL файла index.html:${NC} "
+            local _url; read_line _url
+            [[ "$_url" =~ ^https?:// ]] || { log_error "Нужен URL вида http(s)://..."; return 1; }
+            SELFMASK_SITE_SOURCE="$_url"
+            ;;
+        6)
+            echo -e "  ${DIM}Укажите абсолютный путь к папке или к её index.html.${NC}"
+            echo -en "  ${BOLD}Путь:${NC} "
+            local _path _resolved; read_line _path
+            _resolved=$(_selfmask_resolve_local_site "$_path") || return 1
+            SELFMASK_SITE_SOURCE="$_resolved"
+            ;;
+        *) SELFMASK_SITE_SOURCE="stub" ;;
+    esac
 }
 
 # Чем менеджер будет держать движок. Docker привычнее, бинарник экономит
@@ -560,7 +646,10 @@ run_fix_arsenal_wizard() {
       fi
     fi 
 
-    # Оптимизация By-MEKO
+    run_meko_optimization_wizard
+}
+
+run_meko_optimization_wizard() {
     echo ""
     echo -e "  ${BOLD}Оптимизация системы By-MEKO${NC}"
     echo -e "  ${DIM}TCP keepalive 45s, BBR, расширенные очереди.${NC}"
@@ -581,8 +670,11 @@ show_install_summary() {
     echo -e "  ${BRIGHT_GREEN}${BOLD}УСТАНОВКА ЗАВЕРШЕНА${NC}"
     echo ""
     echo -e "  ${BOLD}Сервер:${NC} ${server_ip:-?}"
-    echo -e "  ${BOLD}Порт:${NC}   ${PROXY_PORT}"
-    echo -e "  ${BOLD}Домен:${NC} ${PROXY_DOMAIN}"
+    echo -e "  ${BOLD}Режим:${NC}  $(proxy_transport_mode_title)"
+    if mtproto_is_enabled; then
+        echo -e "  ${BOLD}MTProto:${NC} ${PROXY_PORT}, SNI ${PROXY_DOMAIN}"
+    fi
+    web_is_enabled && echo -e "  ${BOLD}WEB:${NC}    https://$(web_domain 2>/dev/null)"
     echo -e "  ${BOLD}Движок:${NC} telemt (Rust), $(engine_backend_title)"
     echo ""
 
@@ -594,10 +686,14 @@ show_install_summary() {
             [ "${SECRETS_ENABLED[$i]}" = "true" ] || continue
             echo -e "  ${BRIGHT_GREEN}${SECRETS_LABELS[$i]}:${NC}"
             local _kind _fs
-            while IFS='|' read -r _kind _fs; do
+            while mtproto_is_enabled && IFS='|' read -r _kind _fs; do
                 [ -n "$_fs" ] || continue
                 echo -e "  ${DIM}$(link_kind_title "$_kind"):${NC} ${CYAN}tg://proxy?server=${server_ip}&port=${PROXY_PORT}&secret=${_fs}${NC}"
             done <<< "$(build_link_secrets "${SECRETS_KEYS[$i]}")"
+            if web_is_enabled; then
+                local _wl; _wl=$(web_link_for_secret "${SECRETS_KEYS[$i]}" 2>/dev/null)
+                [ -n "$_wl" ] && echo -e "  ${DIM}WEB:${NC} ${CYAN}${_wl}${NC}"
+            fi
             echo ""
         done
     fi
@@ -608,7 +704,13 @@ show_install_summary() {
     echo -e "  ${GREEN}mtproxyl secret add${NC}   Добавить пользователя"
     echo -e "  ${GREEN}mtproxyl help${NC}         Справка"
     echo ""
-    echo -e "  ${YELLOW}Фаервол: откройте TCP порт, если закрыт ${PROXY_PORT}${NC}"
+    if ! web_is_enabled; then
+        echo -e "  ${YELLOW}Фаервол: откройте TCP порт ${PROXY_PORT}${NC}"
+    elif web_is_only_mode; then
+        echo -e "  ${YELLOW}Фаервол: откройте TCP 80 и 443${NC}"
+    else
+        echo -e "  ${YELLOW}Фаервол: откройте TCP ${PROXY_PORT}, 80 и 443${NC}"
+    fi
     echo ""
 }
 
